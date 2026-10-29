@@ -11,7 +11,8 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
-import android.webkit.WebViewClient
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import java.net.HttpURLConnection
@@ -23,6 +24,14 @@ class MainActivity : AppCompatActivity() {
     private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
     private val fileChooserRequestCode = 1001
     private var popupWebView: WebView? = null
+    private val webViewStateKey = "webview_state"
+    private val cookieFlushHandler = Handler(Looper.getMainLooper())
+    private val cookieFlushRunnable = object : Runnable {
+        override fun run() {
+            CookieManager.getInstance().flush()
+            cookieFlushHandler.postDelayed(this, 30_000L)
+        }
+    }
 
     private val desktopUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -48,6 +57,7 @@ class MainActivity : AppCompatActivity() {
             setSupportMultipleWindows(true)
             userAgentString = desktopUserAgent
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+            cacheMode = WebSettings.LOAD_DEFAULT
         }
 
         webView.webViewClient = object : WebViewClient() {
@@ -61,7 +71,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // Strip X-Requested-With header for Google OAuth (WebView detection)
             override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                 val url = request?.url?.toString() ?: return null
                 val isGoogleOAuth = url.contains("accounts.google.com") ||
@@ -70,22 +79,18 @@ class MainActivity : AppCompatActivity() {
                 if (!isGoogleOAuth || request?.method != "GET") return null
 
                 return try {
-                    val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                    var current = (URL(url).openConnection() as HttpURLConnection).apply {
                         requestMethod = "GET"
                         instanceFollowRedirects = false
                         setRequestProperty("User-Agent", desktopUserAgent)
-                        // Copy original headers except X-Requested-With
                         request?.requestHeaders?.forEach { (k, v) ->
                             if (!k.equals("X-Requested-With", ignoreCase = true)) {
                                 setRequestProperty(k, v)
                             }
                         }
-                        // Sync cookies from CookieManager
                         val cookies = CookieManager.getInstance().getCookie(url)
                         if (!cookies.isNullOrEmpty()) setRequestProperty("Cookie", cookies)
                     }
-                    // Follow redirects manually, syncing cookies
-                    var current = conn
                     var hops = 0
                     while (hops < 10 && current.responseCode in 300..399) {
                         val loc = current.getHeaderField("Location") ?: break
@@ -100,9 +105,7 @@ class MainActivity : AppCompatActivity() {
                         }
                         hops++
                     }
-                    // Apply Set-Cookie to CookieManager
-                    val setCookies = current.headerFields["Set-Cookie"]
-                    setCookies?.forEach { c ->
+                    current.headerFields["Set-Cookie"]?.forEach { c ->
                         CookieManager.getInstance().setCookie(current.url.toString(), c)
                     }
                     CookieManager.getInstance().flush()
@@ -194,7 +197,15 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        webView.loadUrl("https://chat.deepseek.com")
+        // Restore WebView state if available (e.g. after rotation)
+        if (savedInstanceState != null) {
+            webView.restoreState(savedInstanceState.getBundle(webViewStateKey))
+        } else {
+            webView.loadUrl("https://chat.deepseek.com")
+        }
+
+        // Periodically flush cookies to disk so the session survives app kill
+        cookieFlushHandler.post(cookieFlushRunnable)
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -210,6 +221,13 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         })
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        val bundle = Bundle()
+        webView.saveState(bundle)
+        outState.putBundle(webViewStateKey, bundle)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -239,6 +257,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        cookieFlushHandler.removeCallbacks(cookieFlushRunnable)
+        CookieManager.getInstance().flush()
         popupWebView?.destroy()
         webView.destroy()
         super.onDestroy()
