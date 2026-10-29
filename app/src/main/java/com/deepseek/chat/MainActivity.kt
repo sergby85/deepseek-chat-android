@@ -11,6 +11,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.os.Handler
 import android.os.Looper
 import androidx.activity.OnBackPressedCallback
@@ -199,7 +200,8 @@ class MainActivity : AppCompatActivity() {
 
         // Restore WebView state if available (e.g. after rotation)
         if (savedInstanceState != null) {
-            webView.restoreState(savedInstanceState.getBundle(webViewStateKey))
+            savedInstanceState.getBundle(webViewStateKey)?.let { webView.restoreState(it) }
+            if (webView.url == null) webView.loadUrl("https://chat.deepseek.com")
         } else {
             webView.loadUrl("https://chat.deepseek.com")
         }
