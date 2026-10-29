@@ -8,11 +8,14 @@ import android.webkit.CookieManager
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
+import java.net.HttpURLConnection
+import java.net.URL
 
 class MainActivity : AppCompatActivity() {
 
@@ -21,8 +24,6 @@ class MainActivity : AppCompatActivity() {
     private val fileChooserRequestCode = 1001
     private var popupWebView: WebView? = null
 
-    // Desktop Chrome UA — helps Google OAuth work inside the WebView
-    // (Google blocks sign-in from embedded WebViews with "disallowed_useragent").
     private val desktopUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -52,12 +53,76 @@ class MainActivity : AppCompatActivity() {
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val url = request?.url?.toString() ?: return false
-                // Keep DeepSeek inside the WebView; open anything else externally
                 return if (url.contains("deepseek.com") || url.contains("deepseek.ai")) {
                     false
                 } else {
                     startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
                     true
+                }
+            }
+
+            // Strip X-Requested-With header for Google OAuth (WebView detection)
+            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                val url = request?.url?.toString() ?: return null
+                val isGoogleOAuth = url.contains("accounts.google.com") ||
+                    url.contains("oauth2") ||
+                    url.contains("google.com/o/oauth2")
+                if (!isGoogleOAuth || request?.method != "GET") return null
+
+                return try {
+                    val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        instanceFollowRedirects = false
+                        setRequestProperty("User-Agent", desktopUserAgent)
+                        // Copy original headers except X-Requested-With
+                        request?.requestHeaders?.forEach { (k, v) ->
+                            if (!k.equals("X-Requested-With", ignoreCase = true)) {
+                                setRequestProperty(k, v)
+                            }
+                        }
+                        // Sync cookies from CookieManager
+                        val cookies = CookieManager.getInstance().getCookie(url)
+                        if (!cookies.isNullOrEmpty()) setRequestProperty("Cookie", cookies)
+                    }
+                    // Follow redirects manually, syncing cookies
+                    var current = conn
+                    var hops = 0
+                    while (hops < 10 && current.responseCode in 300..399) {
+                        val loc = current.getHeaderField("Location") ?: break
+                        current.disconnect()
+                        val nextUrl = if (loc.startsWith("http")) loc else URL(URL(url), loc).toString()
+                        current = (URL(nextUrl).openConnection() as HttpURLConnection).apply {
+                            requestMethod = "GET"
+                            instanceFollowRedirects = false
+                            setRequestProperty("User-Agent", desktopUserAgent)
+                            val c = CookieManager.getInstance().getCookie(nextUrl)
+                            if (!c.isNullOrEmpty()) setRequestProperty("Cookie", c)
+                        }
+                        hops++
+                    }
+                    // Apply Set-Cookie to CookieManager
+                    val setCookies = current.headerFields["Set-Cookie"]
+                    setCookies?.forEach { c ->
+                        CookieManager.getInstance().setCookie(current.url.toString(), c)
+                    }
+                    CookieManager.getInstance().flush()
+
+                    val headers = mutableMapOf<String, String>()
+                    current.headerFields.forEach { (k, v) ->
+                        if (k != null && v != null && k.lowercase() !in setOf("set-cookie", "content-length", "transfer-encoding")) {
+                            headers[k] = v.joinToString(", ")
+                        }
+                    }
+                    WebResourceResponse(
+                        current.contentType?.substringBefore(";")?.trim() ?: "text/html",
+                        current.contentEncoding ?: "UTF-8",
+                        current.responseCode,
+                        current.responseMessage ?: "OK",
+                        headers,
+                        current.inputStream
+                    )
+                } catch (e: Exception) {
+                    null
                 }
             }
 
@@ -84,7 +149,6 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
 
-            // Support Google OAuth popups (window.open) inside the WebView
             override fun onCreateWindow(
                 view: WebView?,
                 isDialog: Boolean,
@@ -100,7 +164,6 @@ class MainActivity : AppCompatActivity() {
                     webViewClient = object : WebViewClient() {
                         override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?): Boolean {
                             val u = r?.url?.toString() ?: return false
-                            // When OAuth finishes and lands back on DeepSeek, load in main WebView
                             if (u.contains("deepseek.com") || u.contains("deepseek.ai")) {
                                 this@MainActivity.webView.loadUrl(u)
                                 (parent as? android.view.ViewGroup)?.removeView(this@apply)
