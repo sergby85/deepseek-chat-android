@@ -1,0 +1,9 @@
+# Treat binary files as binary (no CRLF conversion)
+*.jar binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.keystore binary
+*.jks binary
+*.apk binary
+*.so binary
