@@ -1,0 +1,183 @@
+package com.deepseek.chat
+
+import android.app.Activity
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.webkit.CookieManager
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.activity.OnBackPressedCallback
+import androidx.appcompat.app.AppCompatActivity
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var webView: WebView
+    private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
+    private val fileChooserRequestCode = 1001
+    private var popupWebView: WebView? = null
+
+    // Desktop Chrome UA — helps Google OAuth work inside the WebView
+    // (Google blocks sign-in from embedded WebViews with "disallowed_useragent").
+    private val desktopUserAgent =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        webView = findViewById(R.id.webView)
+
+        val cookieManager = CookieManager.getInstance()
+        cookieManager.setAcceptCookie(true)
+        cookieManager.setAcceptThirdPartyCookies(webView, true)
+
+        webView.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            databaseEnabled = true
+            allowFileAccess = true
+            allowContentAccess = true
+            mediaPlaybackRequiresUserGesture = false
+            setSupportMultipleWindows(true)
+            userAgentString = desktopUserAgent
+            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+        }
+
+        webView.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val url = request?.url?.toString() ?: return false
+                // Keep DeepSeek inside the WebView; open anything else externally
+                return if (url.contains("deepseek.com") || url.contains("deepseek.ai")) {
+                    false
+                } else {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                    true
+                }
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                CookieManager.getInstance().flush()
+            }
+        }
+
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                webView: WebView?,
+                filePathCallback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?
+            ): Boolean {
+                fileUploadCallback?.onReceiveValue(null)
+                fileUploadCallback = filePathCallback
+                val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "*/*"
+                    putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                }
+                startActivityForResult(Intent.createChooser(intent, "Выберите файл"), fileChooserRequestCode)
+                return true
+            }
+
+            // Support Google OAuth popups (window.open) inside the WebView
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: android.os.Message?
+            ): Boolean {
+                val newWebView = WebView(this@MainActivity).apply {
+                    settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        userAgentString = desktopUserAgent
+                    }
+                    webViewClient = object : WebViewClient() {
+                        override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?): Boolean {
+                            val u = r?.url?.toString() ?: return false
+                            // When OAuth finishes and lands back on DeepSeek, load in main WebView
+                            if (u.contains("deepseek.com") || u.contains("deepseek.ai")) {
+                                this@MainActivity.webView.loadUrl(u)
+                                (parent as? android.view.ViewGroup)?.removeView(this@apply)
+                                popupWebView = null
+                                return true
+                            }
+                            return false
+                        }
+                    }
+                }
+                popupWebView = newWebView
+                val container = findViewById<android.widget.FrameLayout>(R.id.webViewContainer)
+                container.addView(newWebView, android.widget.FrameLayout.LayoutParams(
+                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT
+                ))
+                newWebView.webChromeClient = this
+                val transport = resultMsg?.obj as? WebView.WebViewTransport
+                transport?.webView = newWebView
+                resultMsg?.sendToTarget()
+                return true
+            }
+
+            override fun onCloseWindow(window: WebView?) {
+                val container = findViewById<android.widget.FrameLayout>(R.id.webViewContainer)
+                popupWebView?.let { container.removeView(it) }
+                popupWebView = null
+            }
+        }
+
+        webView.loadUrl("https://chat.deepseek.com")
+
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                val target = popupWebView ?: webView
+                if (target.canGoBack()) {
+                    target.goBack()
+                } else if (popupWebView != null) {
+                    findViewById<android.widget.FrameLayout>(R.id.webViewContainer).removeView(popupWebView)
+                    popupWebView = null
+                } else {
+                    isEnabled = false
+                    onBackPressedDispatcher.onBackPressed()
+                }
+            }
+        })
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == fileChooserRequestCode) {
+            val results = if (resultCode == Activity.RESULT_OK) {
+                data?.clipData?.let { clip ->
+                    Array(clip.itemCount) { i -> clip.getItemAt(i).uri }
+                } ?: data?.data?.let { arrayOf(it) }
+            } else null
+            fileUploadCallback?.onReceiveValue(results)
+            fileUploadCallback = null
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        CookieManager.getInstance().flush()
+        webView.onPause()
+        popupWebView?.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        webView.onResume()
+        popupWebView?.onResume()
+    }
+
+    override fun onDestroy() {
+        popupWebView?.destroy()
+        webView.destroy()
+        super.onDestroy()
+    }
+}
